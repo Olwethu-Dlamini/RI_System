@@ -270,37 +270,56 @@ class VehicleAvailabilityService {
   // HELPER FUNCTION: validateInputs
   // PURPOSE: Validate input parameters
   // ==========================================
-  static validateInputs(vehicleId, date, startTime, endTime) {
-    // Check vehicle ID
-    if (!vehicleId || isNaN(vehicleId)) {
-      throw new Error('Valid vehicle ID is required');
-    }
-    
-    // Check date format (basic check)
-    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      throw new Error('Date must be in YYYY-MM-DD format');
-    }
-    
-    // Check time format (basic check)
-    if (!startTime || !/^\d{2}:\d{2}:\d{2}$/.test(startTime)) {
-      throw new Error('Start time must be in HH:MM:SS format');
-    }
-    
-    if (!endTime || !/^\d{2}:\d{2}:\d{2}$/.test(endTime)) {
-      throw new Error('End time must be in HH:MM:SS format');
-    }
-    
-    // Check that end time is after start time
-    if (endTime <= startTime) {
-      throw new Error('End time must be after start time');
-    }
-    
-    // Check that date is not in the past (optional business rule)
-    const today = new Date().toISOString().split('T')[0];
-    if (date < today) {
-      throw new Error('Cannot schedule jobs in the past');
-    }
+  // At line 268, replace the validateInputs function with this:
+
+static validateInputs(vehicleId, date, startTime, endTime) {
+  // Check vehicle ID
+  if (!vehicleId || isNaN(vehicleId)) {
+    throw new Error('Valid vehicle ID is required');
   }
+  
+  // Check date - handle both Date objects and strings
+  if (!date) {
+    throw new Error('Date is required');
+  }
+  
+  // If date is a Date object (from MySQL), convert to YYYY-MM-DD string
+  if (date instanceof Date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    date = `${year}-${month}-${day}`;
+  }
+  
+  // Now validate string format
+  if (typeof date === 'string' && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error(`Date must be in YYYY-MM-DD format, got: ${date}`);
+  }
+  
+  // Check time format
+  if (!startTime || !/^\d{2}:\d{2}:\d{2}$/.test(startTime)) {
+    throw new Error('Start time must be in HH:MM:SS format');
+  }
+  
+  if (!endTime || !/^\d{2}:\d{2}:\d{2}$/.test(endTime)) {
+    throw new Error('End time must be in HH:MM:SS format');
+  }
+  
+  // Check that end time is after start time
+  if (endTime <= startTime) {
+    throw new Error('End time must be after start time');
+  }
+  
+  // Check that date is not in the past
+  const today = new Date().toISOString().split('T')[0];
+  const checkDate = (date instanceof Date) 
+    ? date.toISOString().split('T')[0] 
+    : date;
+    
+  if (checkDate < today) {
+    throw new Error('Cannot schedule jobs in the past');
+  }
+}
   
   // ==========================================
   // HELPER FUNCTION: validateVehicle

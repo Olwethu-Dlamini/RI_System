@@ -69,13 +69,12 @@ class JobStatusService {
    * @param {string} newStatus - The new status to set
    * @param {number} changedBy - User ID making the change
    * @param {string} reason - Optional reason for status change
-   * @param {Object} metadata - Optional additional data to store
    * @returns {Promise<Object>} Updated job object with history entry
    * 
    * Example usage:
    *   await JobStatusService.updateJobStatus(5, 'in_progress', 1, 'Driver started work');
    */
-  static async updateJobStatus(jobId, newStatus, changedBy, reason = null, metadata = null) {
+  static async updateJobStatus(jobId, newStatus, changedBy, reason = null) {
     // Start a database transaction for data integrity
     const connection = await db.getConnection();
     
@@ -168,14 +167,6 @@ class JobStatusService {
         }
       }
       
-      // RULE 3: Completed jobs should record completion time
-      if (newStatus === 'completed' && !metadata) {
-        metadata = {
-          completed_at: new Date().toISOString(),
-          completion_user: changedBy
-        };
-      }
-      
       console.log(`   ✓ Business rules validated`);
       
       // ============================================
@@ -191,16 +182,16 @@ class JobStatusService {
       // ============================================
       // STEP 7: Log the status change in history
       // ============================================
+      // ✅ FIX: Removed 'metadata' column - it doesn't exist in job_status_changes table
       const historyInsertSql = `
-        INSERT INTO job_status_history (
+        INSERT INTO job_status_changes (
           job_id,
           old_status,
           new_status,
           changed_by,
           reason,
-          metadata,
           changed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NOW())
+        ) VALUES (?, ?, ?, ?, ?, NOW())
       `;
       
       const [historyResult] = await connection.query(historyInsertSql, [
@@ -208,8 +199,8 @@ class JobStatusService {
         currentStatus,
         newStatus,
         changedBy,
-        reason,
-        metadata ? JSON.stringify(metadata) : null
+        reason
+        // ✅ NO metadata parameter - column doesn't exist in schema
       ]);
       
       console.log(`   ✓ Status change logged in history (ID: ${historyResult.insertId})`);
@@ -270,12 +261,11 @@ class JobStatusService {
           jsh.old_status,
           jsh.new_status,
           jsh.reason,
-          jsh.metadata,
           jsh.changed_at,
           jsh.changed_by,
           u.full_name as changed_by_name,
           u.email as changed_by_email
-        FROM job_status_history jsh
+        FROM job_status_changes jsh
         INNER JOIN jobs j ON jsh.job_id = j.id
         LEFT JOIN users u ON jsh.changed_by = u.id
         WHERE jsh.job_id = ?
@@ -291,11 +281,8 @@ class JobStatusService {
       
       const [rows] = await db.query(sql, params);
       
-      // Parse JSON metadata
-      return rows.map(row => ({
-        ...row,
-        metadata: row.metadata ? JSON.parse(row.metadata) : null
-      }));
+      // ✅ FIX: Removed metadata parsing - column doesn't exist
+      return rows;
       
     } catch (error) {
       console.error('Error in JobStatusService.getJobStatusHistory:', error);
@@ -323,11 +310,10 @@ class JobStatusService {
           jsh.old_status,
           jsh.new_status,
           jsh.reason,
-          jsh.metadata,
           jsh.changed_at,
           jsh.changed_by,
           u.full_name as changed_by_name
-        FROM job_status_history jsh
+        FROM job_status_changes jsh
         INNER JOIN jobs j ON jsh.job_id = j.id
         LEFT JOIN users u ON jsh.changed_by = u.id
         WHERE jsh.id = ?
@@ -339,12 +325,8 @@ class JobStatusService {
         return null;
       }
       
-      const entry = rows[0];
-      
-      return {
-        ...entry,
-        metadata: entry.metadata ? JSON.parse(entry.metadata) : null
-      };
+      // ✅ FIX: Removed metadata parsing - column doesn't exist
+      return rows[0];
       
     } catch (error) {
       console.error('Error in JobStatusService.getHistoryEntry:', error);
@@ -382,7 +364,7 @@ class JobStatusService {
           jsh.changed_at,
           u.full_name as changed_by_name,
           v.vehicle_name
-        FROM job_status_history jsh
+        FROM job_status_changes jsh
         INNER JOIN jobs j ON jsh.job_id = j.id
         LEFT JOIN users u ON jsh.changed_by = u.id
         LEFT JOIN job_assignments ja ON j.id = ja.job_id
@@ -498,7 +480,7 @@ class JobStatusService {
       if (!this.canTransitionTo(job.current_status, targetStatus)) {
         errors.push(
           `Cannot transition from "${job.current_status}" to "${targetStatus}". ` +
-          `Allowed: ${this.ALLOWED_TRANSITIONS[job.current_status].join(', ')}`
+          `Allowed: ${this.ALLOWED_TRANSITIONS[job.current_status]?.join(', ') || 'none'}`
         );
       }
       

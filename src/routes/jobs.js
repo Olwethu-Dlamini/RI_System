@@ -121,3 +121,74 @@ router.post('/', async (req, res) => {
 });
 
 module.exports = router;
+
+// PUT /api/jobs/:id/schedule - Update job schedule
+router.put('/:id/schedule', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      scheduled_date, 
+      scheduled_time_start, 
+      scheduled_time_end, 
+      estimated_duration_minutes 
+    } = req.body;
+
+    // Validate date format
+    if (!scheduled_date || !/^\d{4}-\d{2}-\d{2}$/.test(scheduled_date)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid date format. Use YYYY-MM-DD' 
+      });
+    }
+
+    // Check for double-booking
+    const conflict = await checkVehicleConflict(
+      null, // Not assigning vehicle, just checking time
+      scheduled_date,
+      scheduled_time_start,
+      scheduled_time_end
+    );
+
+    if (conflict) {
+      return res.status(409).json({
+        success: false,
+        message: 'Time slot conflicts with existing job',
+        conflict
+      });
+    }
+
+    const [result] = await db.query(
+      `UPDATE jobs 
+       SET scheduled_date = ?, 
+           scheduled_time_start = ?, 
+           scheduled_time_end = ?, 
+           estimated_duration_minutes = ?,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [scheduled_date, scheduled_time_start, scheduled_time_end, 
+       estimated_duration_minutes, id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Job not found' 
+      });
+    }
+
+    const [updatedJob] = await db.query('SELECT * FROM jobs WHERE id = ?', [id]);
+
+    res.json({
+      success: true,
+      message: 'Job schedule updated',
+      job: updatedJob[0]
+    });
+  } catch (error) {
+    console.error('Update schedule error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error',
+      error: error.message 
+    });
+  }
+});

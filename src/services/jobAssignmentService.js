@@ -56,7 +56,11 @@ class JobAssignmentService {
    *   });
    */
   static async assignJobToVehicle(assignmentData) {
+    const connection = await db.getConnection();
+    
     try {
+      await connection.beginTransaction();
+      
       // Extract data from input
       const { job_id, vehicle_id, driver_id = null, notes = null, assigned_by } = assignmentData;
       
@@ -83,19 +87,16 @@ class JobAssignmentService {
       
       // Check if job is already assigned
       if (job.current_status === 'assigned') {
-        throw new Error(
-          `Job ${job.job_number} is already assigned to vehicle "${job.vehicle_name}". ` +
-          `Please unassign it first before reassigning.`
-        );
+        console.log('   ℹ️  Job is already assigned - proceeding with reassignment');
       }
       
       // Check if job is in a status that allows assignment
-      // We can only assign jobs that are "pending"
-      if (job.current_status !== 'pending') {
+      // We can only assign jobs that are "pending" or already "assigned" (for reassignment)
+      if (!['pending', 'assigned'].includes(job.current_status)) {
         throw new Error(
           `Cannot assign job with status "${job.current_status}". ` +
-          `Job must be in "pending" status to be assigned. ` +
-          `Current allowed transitions: ${JobStatusService.ALLOWED_TRANSITIONS[job.current_status].join(', ')}`
+          `Job must be in "pending" or "assigned" status to be assigned. ` +
+          `Current allowed transitions: ${JobStatusService.ALLOWED_TRANSITIONS[job.current_status]?.join(', ') || 'none'}`
         );
       }
       
@@ -176,12 +177,17 @@ class JobAssignmentService {
       }
       
       console.log('   ✓ No scheduling conflicts found');
-      console.log(`   ✓ Vehicle is available for ${availabilityCheck.details.duration} minutes`);
+      console.log(`   ✓ Vehicle is available for ${availabilityCheck.details?.duration || 'N/A'} minutes`);
       
       // ============================================
       // STEP 4: Create the assignment record
       // ============================================
       console.log(`\n💾 STEP 4: Creating job assignment in database...`);
+      
+      // ✅ FIX: Delete existing assignment for this job first (handles re-assignment)
+      // This prevents "Duplicate entry" errors on the unique_vehicle_job constraint
+      await connection.query('DELETE FROM job_assignments WHERE job_id = ?', [job_id]);
+      console.log('   ✓ Cleared any existing assignment for this job');
       
       const assignmentSql = `
         INSERT INTO job_assignments (
@@ -194,7 +200,7 @@ class JobAssignmentService {
         ) VALUES (?, ?, ?, ?, ?, NOW())
       `;
       
-      const [assignmentResult] = await db.query(assignmentSql, [
+      const [assignmentResult] = await connection.query(assignmentSql, [
         job_id,
         vehicle_id,
         driver_id,
@@ -218,9 +224,11 @@ class JobAssignmentService {
       console.log(`\n🔄 STEP 5: Updating job status to "assigned"...`);
       
       // Use JobStatusService to ensure proper status transition
+      // ✅ FIX: Only pass the 3 parameters that the service expects
       await JobStatusService.updateJobStatus(
         job_id, 
         'assigned',
+        assigned_by,
         `Assigned to vehicle: ${vehicle.vehicle_name} (${vehicle.license_plate})`
       );
       
@@ -243,14 +251,23 @@ class JobAssignmentService {
       console.log(`   Time: ${completeAssignment.scheduled_time_start} - ${completeAssignment.scheduled_time_end}`);
       console.log('═══════════════════════════════════════════════════════\n');
       
-      return completeAssignment;
+      await connection.commit();
+      
+      return {
+        success: true,
+        message: 'Job assigned successfully',
+        data: completeAssignment
+      };
       
     } catch (error) {
+      await connection.rollback();
       console.error('\n❌ Error in JobAssignmentService.assignJobToVehicle:');
       console.error('═══════════════════════════════════════════════════════');
       console.error(error.message);
       console.error('═══════════════════════════════════════════════════════\n');
       throw error;
+    } finally {
+      connection.release();
     }
   }
   
@@ -263,13 +280,18 @@ class JobAssignmentService {
    * This removes the assignment and changes job status back to "pending"
    * 
    * @param {number} jobId - The job ID to unassign
+   * @param {number} changedBy - User ID performing the unassignment
    * @returns {Promise<Object>} Result of unassignment
    * 
    * Example usage:
-   *   const result = await JobAssignmentService.unassignJob(5);
+   *   const result = await JobAssignmentService.unassignJob(5, 1);
    */
-  static async unassignJob(jobId) {
+  static async unassignJob(jobId, changedBy) {
+    const connection = await db.getConnection();
+    
     try {
+      await connection.beginTransaction();
+      
       console.log('═══════════════════════════════════════════════════════');
       console.log('🔄 Starting Job Unassignment Process');
       console.log('═══════════════════════════════════════════════════════');
@@ -297,7 +319,7 @@ class JobAssignmentService {
         WHERE ja.job_id = ?
       `;
       
-      const [assignments] = await db.query(checkSql, [jobId]);
+      const [assignments] = await connection.query(checkSql, [jobId]);
       
       if (assignments.length === 0) {
         throw new Error(
@@ -333,7 +355,7 @@ class JobAssignmentService {
         DELETE FROM job_assignments WHERE job_id = ?
       `;
       
-      await db.query(deleteSql, [jobId]);
+      await connection.query(deleteSql, [jobId]);
       console.log('   ✓ Assignment removed');
       
       // Update job status back to pending using JobStatusService
@@ -342,10 +364,13 @@ class JobAssignmentService {
       await JobStatusService.updateJobStatus(
         jobId, 
         'pending',
+        changedBy,
         `Vehicle unassigned. Job returned to pending status.`
       );
       
       console.log('   ✓ Job status updated to pending');
+      
+      await connection.commit();
       
       console.log('\n═══════════════════════════════════════════════════════');
       console.log('✅ Job Unassignment Completed Successfully!');
@@ -365,11 +390,14 @@ class JobAssignmentService {
       };
       
     } catch (error) {
+      await connection.rollback();
       console.error('\n❌ Error in JobAssignmentService.unassignJob:');
       console.error('═══════════════════════════════════════════════════════');
       console.error(error.message);
       console.error('═══════════════════════════════════════════════════════\n');
       throw error;
+    } finally {
+      connection.release();
     }
   }
   
@@ -417,20 +445,16 @@ class JobAssignmentService {
       console.log(`   Current Vehicle: ${job.vehicle_name || 'None'}`);
       console.log(`   Status: ${job.current_status}\n`);
       
-      // Only allow reassignment if job is currently assigned
-      if (job.current_status !== 'assigned') {
+      // Only allow reassignment if job is currently assigned or pending
+      if (!['pending', 'assigned'].includes(job.current_status)) {
         throw new Error(
           `Job ${job.job_number} cannot be reassigned because it is in "${job.current_status}" status. ` +
-          `Only jobs in "assigned" status can be reassigned directly.`
+          `Only jobs in "pending" or "assigned" status can be reassigned directly.`
         );
       }
       
-      // Step 1: Unassign from current vehicle
-      console.log('   Step 1: Removing current assignment...');
-      await this.unassignJob(job_id);
-      
-      // Step 2: Assign to new vehicle
-      console.log('   Step 2: Assigning to new vehicle...');
+      // Directly assign to new vehicle (the DELETE happens inside assignJobToVehicle)
+      console.log('   Assigning to new vehicle...');
       const newAssignment = await this.assignJobToVehicle({
         job_id,
         vehicle_id: new_vehicle_id,
@@ -443,8 +467,8 @@ class JobAssignmentService {
       console.log('✅ Job Reassignment Completed Successfully!');
       console.log('═══════════════════════════════════════════════════════');
       console.log(`   Job: ${job.job_number}`);
-      console.log(`   Old Vehicle: ${job.vehicle_name}`);
-      console.log(`   New Vehicle: ${newAssignment.vehicle_name}`);
+      console.log(`   Old Vehicle: ${job.vehicle_name || 'None'}`);
+      console.log(`   New Vehicle: ${newAssignment.data?.vehicle_name || 'N/A'}`);
       console.log('═══════════════════════════════════════════════════════\n');
       
       return newAssignment;
