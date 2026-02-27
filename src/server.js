@@ -11,12 +11,35 @@ const db         = require('./config/database');
 const routes     = require('./routes');
 const swaggerUi  = require('swagger-ui-express');
 const swaggerSpec = require('./config/swagger');
+const { USER_ROLE, PERMISSIONS } = require('./config/constants');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
 const JWT_SECRET  = process.env.JWT_SECRET  || 'vehicle_scheduling_secret_2024';
 const JWT_EXPIRES = process.env.JWT_EXPIRES || '8h';
+
+// ============================================
+// Role normalisation helper
+// Keeps legacy DB values ("dispatcher", "driver")
+// working while the new names roll out.
+// ============================================
+function normaliseRole(dbRole) {
+  const map = {
+    dispatcher: USER_ROLE.SCHEDULER,
+    driver    : USER_ROLE.TECHNICIAN,
+    admin     : USER_ROLE.ADMIN,
+    scheduler : USER_ROLE.SCHEDULER,
+    technician: USER_ROLE.TECHNICIAN,
+  };
+  return map[dbRole] ?? dbRole;
+}
+
+function getPermissionsForRole(role) {
+  return Object.entries(PERMISSIONS)
+    .filter(([, roles]) => roles.includes(role))
+    .map(([perm]) => perm);
+}
 
 // ======================
 // MIDDLEWARE
@@ -49,7 +72,7 @@ app.get('/swagger.json', (req, res) => {
 });
 
 // ======================
-// AUTH ROUTES - defined directly here to avoid any caching issues
+// AUTH ROUTES (inline — fast path, no caching issues)
 // ======================
 
 // POST /api/auth/login
@@ -64,33 +87,27 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // Find user in database
     const [rows] = await db.query(
       'SELECT * FROM users WHERE username = ? AND is_active = 1',
       [username]
     );
 
     if (rows.length === 0) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid username or password',
-      });
+      return res.status(401).json({ success: false, message: 'Invalid username or password' });
     }
 
     const user = rows[0];
 
-    // Verify password
     const passwordMatch = await bcrypt.compare(password, user.password_hash);
     if (!passwordMatch) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid username or password',
-      });
+      return res.status(401).json({ success: false, message: 'Invalid username or password' });
     }
 
-    // Generate JWT token
+    const normalisedRole  = normaliseRole(user.role);
+    const userPermissions = getPermissionsForRole(normalisedRole);
+
     const token = jwt.sign(
-      { id: user.id, username: user.username, role: user.role, email: user.email },
+      { id: user.id, username: user.username, role: normalisedRole, email: user.email },
       JWT_SECRET,
       { expiresIn: JWT_EXPIRES }
     );
@@ -100,20 +117,18 @@ app.post('/api/auth/login', async (req, res) => {
       token    : token,
       expiresIn: JWT_EXPIRES,
       user     : {
-        id       : user.id,
-        username : user.username,
-        full_name: user.full_name,
-        role     : user.role,
-        email    : user.email,
+        id         : user.id,
+        username   : user.username,
+        full_name  : user.full_name,
+        role       : normalisedRole,        // ← "admin" | "scheduler" | "technician"
+        email      : user.email,
+        permissions: userPermissions,       // ← e.g. ["jobs:read", "jobs:create", ...]
       },
     });
 
   } catch (error) {
     console.error('Login error:', error.message);
-    return res.status(500).json({
-      success: false,
-      message: 'Login failed: ' + error.message,
-    });
+    return res.status(500).json({ success: false, message: 'Login failed: ' + error.message });
   }
 });
 
@@ -133,7 +148,13 @@ app.get('/api/auth/me', async (req, res) => {
 
     if (rows.length === 0) return res.status(404).json({ success: false, message: 'User not found' });
 
-    return res.status(200).json({ success: true, user: rows[0] });
+    const normalisedRole  = normaliseRole(rows[0].role);
+    const userPermissions = getPermissionsForRole(normalisedRole);
+
+    return res.status(200).json({
+      success: true,
+      user   : { ...rows[0], role: normalisedRole, permissions: userPermissions },
+    });
 
   } catch (error) {
     return res.status(401).json({ success: false, message: 'Invalid or expired token' });
@@ -162,14 +183,10 @@ app.get('/', (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    status   : 'healthy',
-    uptime   : process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
+  res.status(200).json({ status: 'healthy', uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
-// 404 handler
+// 404
 app.use((req, res) => {
   res.status(404).json({ success: false, error: 'Route not found', path: req.originalUrl });
 });
@@ -198,6 +215,8 @@ app.use((err, req, res, next) => {
       console.log(`📡 Server:  http://localhost:${PORT}`);
       console.log(`🔗 API:     http://localhost:${PORT}/api`);
       console.log(`🔐 Login:   POST http://localhost:${PORT}/api/auth/login`);
+      console.log('='.repeat(50) + '\n');
+      console.log('Roles:  admin | scheduler | technician');
       console.log('='.repeat(50) + '\n');
     });
   } catch (err) {

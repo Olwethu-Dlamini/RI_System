@@ -3,24 +3,20 @@
 // PURPOSE: Handle login and token generation
 // ============================================
 
-const db        = require('../config/database');
-const bcrypt    = require('bcryptjs');
-const jwt       = require('jsonwebtoken');
+const db       = require('../config/database');
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
+const { USER_ROLE } = require('../config/constants');
 
-// JWT secret key - stored in .env file
-// Never hardcode this in production
 const JWT_SECRET  = process.env.JWT_SECRET  || 'vehicle_scheduling_secret_2024';
-const JWT_EXPIRES = process.env.JWT_EXPIRES || '8h'; // Token valid for 8 hours (one work day)
+const JWT_EXPIRES = process.env.JWT_EXPIRES || '8h';
 
 class AuthController {
 
   // ==========================================
   // POST /api/auth/login
-  // PURPOSE: Validate credentials, return token
   // ==========================================
   /**
-   * Login with username + password
-   *
    * Request body:
    * {
    *   "username": "admin",
@@ -31,12 +27,14 @@ class AuthController {
    * {
    *   "success": true,
    *   "token": "eyJhbGci...",
+   *   "expiresIn": "8h",
    *   "user": {
    *     "id": 1,
    *     "username": "admin",
    *     "full_name": "System Admin",
-   *     "role": "admin",
-   *     "email": "admin@company.com"
+   *     "role": "admin",          ← "admin" | "scheduler" | "technician"
+   *     "email": "admin@company.com",
+   *     "permissions": [...]      ← array of permission keys for this role
    *   }
    * }
    */
@@ -44,9 +42,6 @@ class AuthController {
     try {
       const { username, password } = req.body;
 
-      // ----------------------------------------
-      // Validate required fields
-      // ----------------------------------------
       if (!username || !password) {
         return res.status(400).json({
           success: false,
@@ -54,17 +49,13 @@ class AuthController {
         });
       }
 
-      // ----------------------------------------
-      // Find user in database
-      // ----------------------------------------
+      // ── Find active user ──────────────────
       const [rows] = await db.query(
         'SELECT * FROM users WHERE username = ? AND is_active = 1',
         [username]
       );
 
       if (rows.length === 0) {
-        // User not found or inactive
-        // Use generic message so we don't reveal if username exists
         return res.status(401).json({
           success: false,
           message: 'Invalid username or password',
@@ -73,12 +64,8 @@ class AuthController {
 
       const user = rows[0];
 
-      // ----------------------------------------
-      // Check password
-      // bcrypt.compare handles hashed passwords safely
-      // ----------------------------------------
+      // ── Validate password ─────────────────
       const passwordMatch = await bcrypt.compare(password, user.password_hash);
-
       if (!passwordMatch) {
         return res.status(401).json({
           success: false,
@@ -86,35 +73,37 @@ class AuthController {
         });
       }
 
-      // ----------------------------------------
-      // Generate JWT token
-      // Payload contains user info (NOT password)
-      // ----------------------------------------
+      // ── Normalise role ────────────────────
+      // Migrate legacy role names to new ones gracefully.
+      // "dispatcher" → "scheduler", "driver" → "technician"
+      const normalisedRole = AuthController._normaliseRole(user.role);
+
+      // ── Generate JWT ──────────────────────
       const token = jwt.sign(
         {
           id      : user.id,
           username: user.username,
-          role    : user.role,
+          role    : normalisedRole,
           email   : user.email,
         },
         JWT_SECRET,
         { expiresIn: JWT_EXPIRES }
       );
 
-      // ----------------------------------------
-      // Return token + safe user object
-      // Never return password_hash to client
-      // ----------------------------------------
+      // ── Build permission list for this role ──
+      const userPermissions = AuthController._getPermissionsForRole(normalisedRole);
+
       return res.status(200).json({
         success  : true,
         token    : token,
         expiresIn: JWT_EXPIRES,
         user     : {
-          id       : user.id,
-          username : user.username,
-          full_name: user.full_name,
-          role     : user.role,
-          email    : user.email,
+          id         : user.id,
+          username   : user.username,
+          full_name  : user.full_name,
+          role       : normalisedRole,
+          email      : user.email,
+          permissions: userPermissions,
         },
       });
 
@@ -129,51 +118,82 @@ class AuthController {
 
   // ==========================================
   // GET /api/auth/me
-  // PURPOSE: Return current logged-in user info
-  // REQUIRES: Valid JWT token in header
   // ==========================================
   static async getMe(req, res) {
     try {
-      // req.user is set by authMiddleware
       const [rows] = await db.query(
         'SELECT id, username, full_name, role, email, is_active, created_at FROM users WHERE id = ?',
         [req.user.id]
       );
 
       if (rows.length === 0) {
-        return res.status(404).json({
-          success: false,
-          message: 'User not found',
-        });
+        return res.status(404).json({ success: false, message: 'User not found' });
       }
+
+      const user           = rows[0];
+      const normalisedRole = AuthController._normaliseRole(user.role);
+      const userPermissions = AuthController._getPermissionsForRole(normalisedRole);
 
       return res.status(200).json({
         success: true,
-        user   : rows[0],
+        user   : {
+          ...user,
+          role       : normalisedRole,
+          permissions: userPermissions,
+        },
       });
 
     } catch (error) {
       console.error('GetMe error:', error.message);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to get user info',
-      });
+      return res.status(500).json({ success: false, message: 'Failed to get user info' });
     }
   }
 
   // ==========================================
   // POST /api/auth/logout
-  // PURPOSE: Client-side logout (clear token)
-  // NOTE: JWT is stateless - real logout happens
-  //       on Flutter side by deleting stored token
   // ==========================================
   static async logout(req, res) {
-    // With JWT we just tell the client to delete their token
-    // No server-side session to destroy
-    return res.status(200).json({
-      success: true,
-      message: 'Logged out successfully',
-    });
+    // JWT is stateless — actual logout is handled client-side
+    // by deleting the stored token.
+    return res.status(200).json({ success: true, message: 'Logged out successfully' });
+  }
+
+  // ==========================================
+  // PRIVATE HELPERS
+  // ==========================================
+
+  /**
+   * Map legacy DB role values to the new role names.
+   *
+   *   DB value      New role
+   *   ──────────────────────
+   *   admin       → admin
+   *   dispatcher  → scheduler   (legacy)
+   *   driver      → technician  (legacy)
+   *   scheduler   → scheduler
+   *   technician  → technician
+   */
+  static _normaliseRole(dbRole) {
+    const map = {
+      dispatcher: USER_ROLE.SCHEDULER,
+      driver    : USER_ROLE.TECHNICIAN,
+      admin     : USER_ROLE.ADMIN,
+      scheduler : USER_ROLE.SCHEDULER,
+      technician: USER_ROLE.TECHNICIAN,
+    };
+    return map[dbRole] ?? dbRole;
+  }
+
+  /**
+   * Returns all permission keys that a given role holds.
+   * This list is sent to the client so the Flutter app can
+   * show/hide UI elements without making extra round-trips.
+   */
+  static _getPermissionsForRole(role) {
+    const { PERMISSIONS } = require('../config/constants');
+    return Object.entries(PERMISSIONS)
+      .filter(([, roles]) => roles.includes(role))
+      .map(([permission]) => permission);
   }
 }
 

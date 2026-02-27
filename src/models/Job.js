@@ -14,7 +14,55 @@ const db = require('../config/database');
  * Each job has a customer, location, time slot, and gets assigned to a vehicle
  */
 class Job {
-  
+
+  // ==========================================
+  // HELPER: _formatDateOnly
+  // PURPOSE: Convert MySQL Date object OR string to plain 'YYYY-MM-DD'
+  //
+  // WHY THIS EXISTS:
+  //   MySQL returns DATE columns as JavaScript Date objects.
+  //   JSON.stringify calls .toISOString() on them, which shifts to UTC:
+  //   '2026-02-23 00:00:00 UTC+2' → '2026-02-22T22:00:00.000Z'
+  //   Flutter then parses the 22nd instead of the 23rd.
+  //
+  //   Fix: always convert to a plain 'YYYY-MM-DD' string on the Node side
+  //   before the response leaves the server. We use LOCAL date methods
+  //   (getFullYear/getMonth/getDate) — NOT UTC methods — so the date
+  //   is never shifted by the server's timezone offset.
+  // ==========================================
+  static _formatDateOnly(value) {
+    if (!value) return value;
+    // Already a plain date string like '2026-02-23' — return as-is
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return value;
+    }
+    // JavaScript Date object (what MySQL driver returns for DATE columns)
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return value; // unparseable — return original
+    // Use LOCAL year/month/day — NOT getUTCFullYear etc — to preserve the date
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  // Apply _formatDateOnly to scheduled_date on every row in an array
+  static _fixDates(rows) {
+    return rows.map(row => ({
+      ...row,
+      scheduled_date: Job._formatDateOnly(row.scheduled_date),
+    }));
+  }
+
+  // Apply _formatDateOnly to a single row object
+  static _fixDate(row) {
+    if (!row) return row;
+    return {
+      ...row,
+      scheduled_date: Job._formatDateOnly(row.scheduled_date),
+    };
+  }
+
   // ==========================================
   // FUNCTION: createJob
   // PURPOSE: Insert a new job into database
@@ -68,10 +116,10 @@ class Job {
         priority = 'normal',
         created_by
       } = jobData;
-      
+
       // Generate unique job number (format: JOB-YYYY-NNNN)
       const jobNumber = await this.generateJobNumber();
-      
+
       // SQL INSERT statement
       // current_status defaults to 'pending' in database
       const sql = `
@@ -90,7 +138,7 @@ class Job {
           created_by
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `;
-      
+
       // Execute INSERT query
       const [result] = await db.query(sql, [
         jobNumber,
@@ -106,31 +154,30 @@ class Job {
         priority,
         created_by
       ]);
-      
+
       // Get the auto-generated ID
       const newJobId = result.insertId;
-      
-      // Fetch and return the complete job object
+
+      // Fetch and return the complete job object (date already fixed inside getJobById)
       const newJob = await this.getJobById(newJobId);
-      
       return newJob;
-      
+
     } catch (error) {
       console.error('Error in Job.createJob:', error);
-      
+
       // Check for specific errors
       if (error.code === 'ER_DUP_ENTRY') {
         throw new Error('Job number already exists (duplicate entry)');
       }
-      
+
       if (error.code === 'ER_NO_REFERENCED_ROW_2') {
         throw new Error('Invalid user ID - creator does not exist');
       }
-      
+
       throw error;
     }
   }
-  
+
   // ==========================================
   // FUNCTION: updateJob
   // PURPOSE: Update job details
@@ -174,11 +221,11 @@ class Job {
         'priority',
         'current_status'
       ];
-      
+
       // Build dynamic UPDATE query
       const updateFields = [];
       const updateValues = [];
-      
+
       // Loop through updates and build SQL
       for (const [key, value] of Object.entries(updates)) {
         if (allowedFields.includes(key)) {
@@ -186,40 +233,40 @@ class Job {
           updateValues.push(value);
         }
       }
-      
+
       // If no valid fields to update
       if (updateFields.length === 0) {
         throw new Error('No valid fields provided for update');
       }
-      
+
       // Add job ID to values array (for WHERE clause)
       updateValues.push(id);
-      
+
       // Build final SQL query
       const sql = `
         UPDATE jobs
         SET ${updateFields.join(', ')}
         WHERE id = ?
       `;
-      
+
       // Execute UPDATE
       const [result] = await db.query(sql, updateValues);
-      
+
       // Check if job exists
       if (result.affectedRows === 0) {
         throw new Error(`Job with ID ${id} not found`);
       }
-      
-      // Fetch and return updated job
+
+      // Fetch and return updated job (date already fixed inside getJobById)
       const updatedJob = await this.getJobById(id);
       return updatedJob;
-      
+
     } catch (error) {
       console.error('Error in Job.updateJob:', error);
       throw error;
     }
   }
-  
+
   // ==========================================
   // FUNCTION: getJobsByDate
   // PURPOSE: Get all jobs scheduled for a specific date
@@ -274,29 +321,28 @@ class Job {
         LEFT JOIN users u ON ja.driver_id = u.id
         WHERE j.scheduled_date = ?
       `;
-      
+
       const params = [date];
-      
+
       // Add status filter if provided
       if (statusFilter) {
         sql += ' AND j.current_status = ?';
         params.push(statusFilter);
       }
-      
+
       // Order by start time
       sql += ' ORDER BY j.scheduled_time_start ASC';
-      
+
       // Execute query
       const [rows] = await db.query(sql, params);
-      
-      return rows;
-      
+      return Job._fixDates(rows); // ✅ fix timezone shift before returning
+
     } catch (error) {
       console.error('Error in Job.getJobsByDate:', error);
       throw error;
     }
   }
-  
+
   // ==========================================
   // FUNCTION: getJobsByVehicle
   // PURPOSE: Get all jobs assigned to a specific vehicle
@@ -353,15 +399,15 @@ class Job {
         LEFT JOIN users u ON ja.driver_id = u.id
         WHERE ja.vehicle_id = ?
       `;
-      
+
       const params = [vehicleId];
-      
+
       // Add date filter if provided
       if (date) {
         sql += ' AND j.scheduled_date = ?';
         params.push(date);
       }
-      
+
       // Exclude certain statuses if provided
       if (excludeStatuses.length > 0) {
         // Build placeholders: ?, ?, ?
@@ -369,21 +415,20 @@ class Job {
         sql += ` AND j.current_status NOT IN (${placeholders})`;
         params.push(...excludeStatuses);
       }
-      
+
       // Order by date and start time
       sql += ' ORDER BY j.scheduled_date ASC, j.scheduled_time_start ASC';
-      
+
       // Execute query
       const [rows] = await db.query(sql, params);
-      
-      return rows;
-      
+      return Job._fixDates(rows); // ✅ fix timezone shift before returning
+
     } catch (error) {
       console.error('Error in Job.getJobsByVehicle:', error);
       throw error;
     }
   }
-  
+
   // ==========================================
   // FUNCTION: getJobById
   // PURPOSE: Get a single job by ID with full details
@@ -440,17 +485,16 @@ class Job {
         LEFT JOIN users creator ON j.created_by = creator.id
         WHERE j.id = ?
       `;
-      
+
       const [rows] = await db.query(sql, [id]);
-      
-      return rows[0] || null;
-      
+      return Job._fixDate(rows[0] || null); // ✅ fix timezone shift before returning
+
     } catch (error) {
       console.error('Error in Job.getJobById:', error);
       throw error;
     }
   }
-  
+
   // ==========================================
   // FUNCTION: getAllJobs
   // PURPOSE: Get all jobs with optional filters
@@ -497,6 +541,10 @@ class Job {
           j.current_status,
           j.priority,
           j.created_at,
+          -- ✅ FIX: vehicle_id and driver_id included so Flutter can place
+          --         jobs in the correct vehicle column on the scheduler
+          ja.vehicle_id,
+          ja.driver_id,
           -- Vehicle info if assigned
           v.vehicle_name,
           v.license_plate,
@@ -508,43 +556,41 @@ class Job {
         LEFT JOIN users u ON ja.driver_id = u.id
         WHERE 1=1
       `;
-      
+
       const params = [];
-      
-      // Apply filters
+
+      // Apply filters — UNCHANGED from original
       if (filters.status) {
         sql += ' AND j.current_status = ?';
         params.push(filters.status);
       }
-      
+
       if (filters.job_type) {
         sql += ' AND j.job_type = ?';
         params.push(filters.job_type);
       }
-      
+
       if (filters.priority) {
         sql += ' AND j.priority = ?';
         params.push(filters.priority);
       }
-      
-      // Order by date and time
+
       sql += ' ORDER BY j.scheduled_date DESC, j.scheduled_time_start DESC';
-      
-      // Apply limit if specified
+
       if (filters.limit) {
         sql += ' LIMIT ?';
         params.push(filters.limit);
       }
-      
+
       const [rows] = await db.query(sql, params);
-      return rows;
-      
+      return Job._fixDates(rows); // ✅ fix timezone shift before returning
+
     } catch (error) {
       console.error('Error in Job.getAllJobs:', error);
       throw error;
     }
   }
-  
+
   // ==========================================
   // FUNCTION: updateJobStatus
   // PURPOSE: Update the status of a job
@@ -567,33 +613,33 @@ class Job {
     try {
       // Valid statuses (must match database ENUM)
       const validStatuses = ['pending', 'assigned', 'in_progress', 'completed', 'cancelled'];
-      
+
       if (!validStatuses.includes(newStatus)) {
         throw new Error(`Invalid status: ${newStatus}. Must be one of: ${validStatuses.join(', ')}`);
       }
-      
+
       const sql = `
         UPDATE jobs
         SET current_status = ?
         WHERE id = ?
       `;
-      
+
       const [result] = await db.query(sql, [newStatus, id]);
-      
+
       if (result.affectedRows === 0) {
         throw new Error(`Job with ID ${id} not found`);
       }
-      
-      // Return updated job
+
+      // Return updated job (date already fixed inside getJobById)
       const updatedJob = await this.getJobById(id);
       return updatedJob;
-      
+
     } catch (error) {
       console.error('Error in Job.updateJobStatus:', error);
       throw error;
     }
   }
-  
+
   // ==========================================
   // HELPER FUNCTION: generateJobNumber
   // PURPOSE: Generate unique job number
@@ -610,7 +656,7 @@ class Job {
     try {
       // Get current year
       const year = new Date().getFullYear();
-      
+
       // Get the highest job number for this year
       const sql = `
         SELECT job_number 
@@ -619,30 +665,30 @@ class Job {
         ORDER BY job_number DESC 
         LIMIT 1
       `;
-      
+
       const [rows] = await db.query(sql, [`JOB-${year}-%`]);
-      
+
       let nextNumber = 1;
-      
+
       if (rows.length > 0) {
         // Extract number from last job_number (e.g., 'JOB-2024-0042' → 42)
         const lastJobNumber = rows[0].job_number;
         const lastNumber = parseInt(lastJobNumber.split('-')[2]);
         nextNumber = lastNumber + 1;
       }
-      
+
       // Format as 4-digit number with leading zeros
       const formattedNumber = String(nextNumber).padStart(4, '0');
-      
+
       // Return complete job number
       return `JOB-${year}-${formattedNumber}`;
-      
+
     } catch (error) {
       console.error('Error in Job.generateJobNumber:', error);
       throw error;
     }
   }
-  
+
   // ==========================================
   // BONUS FUNCTION: deleteJob
   // PURPOSE: Delete a job (only if not assigned)
@@ -663,29 +709,29 @@ class Job {
         FROM job_assignments
         WHERE job_id = ?
       `;
-      
+
       const [checkResult] = await db.query(checkSql, [id]);
-      
+
       if (checkResult[0].assignment_count > 0) {
         throw new Error('Cannot delete job that is assigned to a vehicle. Cancel it instead.');
       }
-      
+
       // Safe to delete
       const deleteSql = 'DELETE FROM jobs WHERE id = ?';
       const [result] = await db.query(deleteSql, [id]);
-      
+
       if (result.affectedRows === 0) {
         throw new Error(`Job with ID ${id} not found`);
       }
-      
+
       return { success: true, message: 'Job deleted successfully' };
-      
+
     } catch (error) {
       console.error('Error in Job.deleteJob:', error);
       throw error;
     }
   }
-  
+
   // ==========================================
   // BONUS FUNCTION: getJobsByDateRange
   // PURPOSE: Get jobs within a date range
@@ -717,10 +763,10 @@ class Job {
         WHERE j.scheduled_date BETWEEN ? AND ?
         ORDER BY j.scheduled_date ASC, j.scheduled_time_start ASC
       `;
-      
+
       const [rows] = await db.query(sql, [startDate, endDate]);
-      return rows;
-      
+      return Job._fixDates(rows); // ✅ fix timezone shift before returning
+
     } catch (error) {
       console.error('Error in Job.getJobsByDateRange:', error);
       throw error;
